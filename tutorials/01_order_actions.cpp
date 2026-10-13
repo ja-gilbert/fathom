@@ -16,8 +16,8 @@ int main() {
         if (mbo.order_id == kOrderId) {
             constexpr auto kSep = "  ";
             std::cout << db::ToIso8601(mbo.ts_recv) << kSep << std::setprecision(2)
-                      << db::pretty::Px{mbo.price} << kSep << std::setw(2)
-                      << std::setfill(' ') << mbo.size << kSep;
+                      << db::pretty::Px{mbo.price} << kSep << std::setw(2) << std::setfill(' ')
+                      << mbo.size << kSep;
             switch (mbo.action) {
                 case db::Action::Add:
                     std::cout << "[A]dded";
@@ -47,8 +47,7 @@ int main() {
     };
 
     // Request a minute of MBO data
-    client.TimeseriesGetRange("GLBX.MDP3",
-                              db::DateTimeRange<std::string>{"2022-08-26T10:59"},
+    client.TimeseriesGetRange("GLBX.MDP3", db::DateTimeRange<std::string>{"2022-08-26T10:59"},
                               {"ES.v.0"}, db::Schema::Mbo, db::SType::Continuous,
                               db::SType::InstrumentId, {}, {}, handle_record);
     return 0;
