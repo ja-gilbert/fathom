@@ -18,3 +18,6 @@ target_compile_options(fathom PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(order_actions tutorials/01_order_actions.cpp)
 target_link_libraries(order_actions PRIVATE databento::databento)
+
+add_executable(order_tracking tutorials/02_order_tracking.cpp)
+target_link_libraries(order_tracking PRIVATE databento::databento)
