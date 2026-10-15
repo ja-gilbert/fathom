@@ -21,3 +21,6 @@ target_link_libraries(order_actions PRIVATE databento::databento)
 
 add_executable(order_tracking tutorials/02_order_tracking.cpp)
 target_link_libraries(order_tracking PRIVATE databento::databento)
+
+add_executable(limit_order_book tutorials/03_limit_order_book.cpp)
+target_link_libraries(limit_order_book PRIVATE databento::databento)
