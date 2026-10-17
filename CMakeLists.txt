@@ -13,8 +13,22 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(databento)
 
+# Header-only engine code and the warning flags, shared by the executable and the tests.
+add_library(fathom_core INTERFACE)
+target_include_directories(fathom_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/engine/src)
+target_compile_options(fathom_core INTERFACE -Wall -Wextra -Wpedantic)
+
 add_executable(fathom engine/src/main.cpp)
-target_compile_options(fathom PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(fathom PRIVATE fathom_core)
+
+# The tests run under ASan and UBSan; no-recover makes a UBSan report fail the run.
+enable_testing()
+add_executable(itch_test engine/tests/itch_test.cpp)
+target_link_libraries(itch_test PRIVATE fathom_core)
+target_compile_options(itch_test PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+                       -fno-omit-frame-pointer)
+target_link_options(itch_test PRIVATE -fsanitize=address,undefined)
+add_test(NAME itch_test COMMAND itch_test)
 
 add_executable(order_actions tutorials/01_order_actions.cpp)
 target_link_libraries(order_actions PRIVATE databento::databento)
