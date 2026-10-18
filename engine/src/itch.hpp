@@ -182,4 +182,19 @@ inline OrderReplace DecodeOrderReplace(std::span<const uint8_t> m) {
             ReadU32(m.data() + 31)};
 }
 
+// 'R' Stock Directory: one per symbol before the open, announcing the day's locate.
+struct StockDirectory {
+    Header hd;
+    std::array<char, 8> stock;  // ticker, space-padded on the right
+};
+
+inline StockDirectory DecodeStockDirectory(std::span<const uint8_t> m) {
+    StockDirectory r{DecodeHeader(m), {}};
+    std::memcpy(r.stock.data(), m.data() + 11, r.stock.size());
+    return r;
+}
+
+// The timestamp of any message, without decoding the rest of it.
+inline uint64_t Timestamp(std::span<const uint8_t> m) { return ReadU48(m.data() + 5); }
+
 }  // namespace itch
