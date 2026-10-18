@@ -1,5 +1,6 @@
-// Tests for the engine's public behaviour: the decoders, the order map's lifecycle
-// rules, the reader's framing across refills, and the end-to-end replay verdict.
+// Tests for the engine's public behaviour: the decoders, the book's lifecycle and
+// price-level rules, the reader's framing across refills, and the replay's verdict,
+// query and crossed-book log.
 //
 // The decoder fixtures are the first message of each type in
 // data/raw/01302019.NASDAQ_ITCH50, with expected values decoded separately with
@@ -15,8 +16,8 @@
 #include <string_view>
 #include <vector>
 
+#include "book.hpp"
 #include "itch_reader.hpp"
-#include "order_map.hpp"
 #include "replay.hpp"
 
 namespace {
@@ -60,6 +61,12 @@ std::vector<uint8_t> SystemEvent(char code) {
     b[11] = static_cast<uint8_t>(code);
     return b;
 }
+std::vector<uint8_t> Directory(uint16_t locate, std::string_view stock) {
+    auto b = Body('R', locate);
+    for (size_t i = 0; i < 8; ++i)
+        b[11 + i] = static_cast<uint8_t>(i < stock.size() ? stock[i] : ' ');
+    return b;
+}
 std::vector<uint8_t> Add(uint16_t locate, uint64_t ref, char side, uint32_t shares,
                          uint32_t price) {
     auto b = Body('A', locate);
@@ -96,6 +103,11 @@ std::vector<uint8_t> Replace(uint16_t locate, uint64_t old_ref, uint64_t new_ref
     PutBE(b, 31, price, 4);
     return b;
 }
+// The same body stamped with a timestamp (nanoseconds since midnight).
+std::vector<uint8_t> At(std::vector<uint8_t> body, uint64_t ts) {
+    PutBE(body, 5, ts, 6);
+    return body;
+}
 
 // A file image: each body behind its 2-byte big-endian length.
 std::vector<uint8_t> File(const std::vector<std::vector<uint8_t>>& bodies) {
@@ -110,7 +122,7 @@ std::vector<uint8_t> File(const std::vector<std::vector<uint8_t>>& bodies) {
 // A well-formed trading day around `bodies`.
 std::vector<uint8_t> Day(std::vector<std::vector<uint8_t>> bodies) {
     bodies.insert(bodies.begin(), SystemEvent('O'));
-    bodies.push_back(SystemEvent('C'));
+    bodies.push_back(At(SystemEvent('C'), fathom::kClose + 1));
     return File(bodies);
 }
 
@@ -118,27 +130,30 @@ std::istringstream Stream(const std::vector<uint8_t>& bytes) {
     return std::istringstream(std::string(bytes.begin(), bytes.end()));
 }
 
-fathom::ReplayResult ReplayBytes(const std::vector<uint8_t>& bytes) {
+fathom::ReplayResult ReplayBytes(const std::vector<uint8_t>& bytes,
+                                 const fathom::ReplayOptions& options = {}) {
     auto in = Stream(bytes);
     std::ostringstream report;
-    return fathom::Replay(in, report);
+    return fathom::Replay(in, report, options);
 }
 
-uint32_t SharesOf(const fathom::OrderMap& map, uint64_t ref) {
-    const auto* order = map.Find(ref);
+fathom::Level L(uint64_t shares, uint32_t count) { return {shares, count}; }
+
+uint32_t SharesOf(const fathom::Book& book, uint64_t ref) {
+    const auto* order = book.Find(ref);
     return order != nullptr ? order->shares : UINT32_MAX;
 }
 
-// A map holding one order: reference 5, locate 1, 100 shares.
-fathom::OrderMap OneOrder() {
-    fathom::OrderMap map;
-    map.Add(itch::DecodeAddOrder(Add(1, 5, 'B', 100, 1000)));
-    return map;
+// A book holding one order: reference 5, locate 1, 100 shares.
+fathom::Book OneOrder() {
+    fathom::Book book;
+    book.Add(itch::DecodeAddOrder(Add(1, 5, 'B', 100, 1000)));
+    return book;
 }
 
 // True if `counter` is the only Stats field that was tripped, exactly once.
-bool OnlyTripped(const fathom::OrderMap& map, uint64_t counter) {
-    const auto& s = map.stats();
+bool OnlyTripped(const fathom::Book& book, uint64_t counter) {
+    const auto& s = book.stats();
     const uint64_t total = s.unknown_ref + s.duplicate_add + s.locate_mismatch + s.over_execute +
                            s.over_cancel + s.zero_share_add;
     return counter == 1 && total == 1 && !s.clean();
@@ -216,8 +231,20 @@ void TestDecodeReplace() {
     CHECK(u.price == 377400);
 }
 
+// The file's second message: the Stock Directory entry for "A" (Agilent), locate 1.
+void TestDecodeStockDirectory() {
+    const auto r =
+        itch::DecodeStockDirectory(FromHex("5200010000"
+                                           "0a4a4cee5599"
+                                           "4120202020202020"
+                                           "4e20000000644e435a2050"
+                                           "4e20314e000000004e"));
+    CHECK(r.hd.locate == 1);
+    CHECK(Str(r.stock.data(), 8) == "A       ");
+}
+
 // The real fixtures only use small values. A 64-bit reference with every byte set and
-// a share count above 16 bits catch a decoder or map that silently narrows.
+// a share count above 16 bits catch a decoder or book that silently narrows.
 void TestWideValues() {
     constexpr uint64_t kRef = 0x8102030405060708ull;
     constexpr uint64_t kRef2 = 0x8807060504030201ull;
@@ -230,79 +257,106 @@ void TestWideValues() {
     const auto u = itch::DecodeOrderReplace(Replace(7, kRef, kRef2, kShares, kPrice));
     CHECK(u.old_ref == kRef && u.new_ref == kRef2 && u.shares == kShares && u.price == kPrice);
 
-    fathom::OrderMap map;
-    map.Add(itch::DecodeAddOrder(Add(1, kRef, 'B', 100000, 1)));
-    map.Add(itch::DecodeAddOrder(Add(1, kRef & 0xffffffffull, 'S', 200, 1)));  // same low 32 bits
-    CHECK(map.live() == 2);
-    map.Execute(1, kRef, 65536);
-    CHECK(SharesOf(map, kRef) == 100000 - 65536);
-    CHECK(map.stats().clean());
+    fathom::Book book;
+    book.Add(itch::DecodeAddOrder(Add(1, kRef, 'B', 100000, 1)));
+    book.Add(itch::DecodeAddOrder(Add(1, kRef & 0xffffffffull, 'S', 200, 1)));  // same low 32 bits
+    CHECK(book.live() == 2);
+    book.Execute(1, kRef, 65536);
+    CHECK(SharesOf(book, kRef) == 100000 - 65536);
+    CHECK(book.stats().clean());
 }
 
-// ----- order map lifecycle rules ----------------------------------------------------
+// ----- book: lifecycle and price levels ---------------------------------------------
 
 void TestLifecycle() {
-    fathom::OrderMap map;
-    map.Add(itch::DecodeAddOrder(Add(484, 9005, 'S', 600, 1072600)));
-    map.Execute(484, 9005, 100);  // E: 600 -> 500
-    CHECK(SharesOf(map, 9005) == 500);
-    map.Cancel(itch::DecodeOrderCancel(Cancel(484, 9005, 200)));  // X: 500 -> 300
-    CHECK(SharesOf(map, 9005) == 300);
-    map.Execute(484, 9005, 300);  // E: 300 -> 0, the order dies
-    CHECK(map.Find(9005) == nullptr);
-    CHECK(map.live() == 0);
-    CHECK(map.stats().peak_live == 1);
-    CHECK(map.stats().clean());
+    fathom::Book book;
+    book.Add(itch::DecodeAddOrder(Add(484, 9005, 'S', 600, 1072600)));
+    book.Execute(484, 9005, 100);  // E: 600 -> 500
+    CHECK(SharesOf(book, 9005) == 500);
+    book.Cancel(itch::DecodeOrderCancel(Cancel(484, 9005, 200)));  // X: 500 -> 300
+    CHECK(SharesOf(book, 9005) == 300);
+    book.Execute(484, 9005, 300);  // E: 300 -> 0, the order dies
+    CHECK(book.Find(9005) == nullptr);
+    CHECK(book.live() == 0);
+    CHECK(book.stats().peak_live == 1);
+    CHECK(book.stats().clean());
 }
 
 void TestReplace() {
-    fathom::OrderMap map;
-    map.Add(itch::DecodeAddOrder(Add(6080, 659, 'S', 1000, 377300)));
-    map.Replace(itch::DecodeOrderReplace(Replace(6080, 659, 14563, 1600, 377400)));
-    CHECK(map.Find(659) == nullptr);  // the old reference is retired
-    const auto* order = map.Find(14563);
+    fathom::Book book;
+    book.Add(itch::DecodeAddOrder(Add(6080, 659, 'S', 1000, 377300)));
+    book.Replace(itch::DecodeOrderReplace(Replace(6080, 659, 14563, 1600, 377400)));
+    CHECK(book.Find(659) == nullptr);  // the old reference is retired
+    const auto* order = book.Find(14563);
     CHECK(order != nullptr && order->side == 'S' && order->locate == 6080);      // carried over
     CHECK(order != nullptr && order->shares == 1600 && order->price == 377400);  // updated
-    CHECK(map.stats().peak_live == 1);
-    map.Replace(itch::DecodeOrderReplace(Replace(6080, 14563, 20000, 0, 377400)));  // to zero
-    CHECK(map.live() == 0);
-    CHECK(map.stats().clean());
+    CHECK(book.stats().peak_live == 1);
+    book.Replace(itch::DecodeOrderReplace(Replace(6080, 14563, 20000, 0, 377400)));  // to zero
+    CHECK(book.live() == 0);
+    CHECK(book.stats().clean());
+}
+
+// Levels follow the orders: totals and counts move with every message, a level is
+// gone once empty, and the best bid/ask are the outermost levels.
+void TestLevels() {
+    fathom::Book book;
+    book.Add(itch::DecodeAddOrder(Add(7, 1, 'B', 100, 1072600)));
+    book.Add(itch::DecodeAddOrder(Add(7, 2, 'B', 200, 1072600)));  // same level
+    book.Add(itch::DecodeAddOrder(Add(7, 3, 'B', 50, 1072500)));   // worse bid
+    book.Add(itch::DecodeAddOrder(Add(7, 4, 'S', 300, 1072800)));
+    book.Add(itch::DecodeAddOrder(Add(7, 5, 'S', 10, 1072700)));  // best ask
+    const auto& l = book.levels(7);
+    CHECK(l.bids.size() == 2 && l.asks.size() == 2);
+    CHECK(l.bids.rbegin()->first == 1072600 && l.bids.rbegin()->second == L(300, 2));
+    CHECK(l.asks.begin()->first == 1072700 && l.asks.begin()->second == L(10, 1));
+
+    book.Execute(7, 1, 100);  // order 1 dies; its level keeps order 2
+    CHECK(l.bids.rbegin()->second == L(200, 1));
+    book.Cancel(itch::DecodeOrderCancel(Cancel(7, 2, 50)));
+    CHECK(l.bids.rbegin()->second == L(150, 1));
+    book.Replace(itch::DecodeOrderReplace(Replace(7, 5, 6, 10, 1072900)));  // ask moves away
+    CHECK(l.asks.begin()->first == 1072800);
+    CHECK(l.asks.size() == 2 && l.asks.count(1072700) == 0);
+    book.Delete(itch::DecodeOrderDelete(Delete(7, 2)));
+    CHECK(l.bids.size() == 1 && l.bids.rbegin()->first == 1072500);
+    CHECK(book.LevelsConsistent());
+    CHECK(book.levels(999).bids.empty());  // a stock with no orders
 }
 
 // Each integrity counter, with the one input that must trip it and nothing else.
 void TestIntegrityCounters() {
-    auto m = OneOrder();
-    m.Execute(1, 9, 10);  // unknown reference
-    CHECK(OnlyTripped(m, m.stats().unknown_ref));
+    auto b = OneOrder();
+    b.Execute(1, 9, 10);  // unknown reference
+    CHECK(OnlyTripped(b, b.stats().unknown_ref));
 
-    m = OneOrder();
-    m.Add(itch::DecodeAddOrder(Add(1, 5, 'B', 100, 1000)));  // duplicate add
-    CHECK(OnlyTripped(m, m.stats().duplicate_add));
+    b = OneOrder();
+    b.Add(itch::DecodeAddOrder(Add(1, 5, 'B', 100, 1000)));  // duplicate add
+    CHECK(OnlyTripped(b, b.stats().duplicate_add));
 
-    m = OneOrder();
-    m.Add(itch::DecodeAddOrder(Add(1, 6, 'B', 100, 1000)));
-    m.Replace(itch::DecodeOrderReplace(Replace(1, 5, 6, 50, 1000)));  // onto a live reference
-    CHECK(OnlyTripped(m, m.stats().duplicate_add));
+    b = OneOrder();
+    b.Add(itch::DecodeAddOrder(Add(1, 6, 'B', 100, 1000)));
+    b.Replace(itch::DecodeOrderReplace(Replace(1, 5, 6, 50, 1000)));  // onto a live reference
+    CHECK(OnlyTripped(b, b.stats().duplicate_add));
 
-    m = OneOrder();
-    m.Replace(itch::DecodeOrderReplace(Replace(1, 5, 5, 50, 1000)));  // keeps its reference
-    CHECK(OnlyTripped(m, m.stats().duplicate_add));
+    b = OneOrder();
+    b.Replace(itch::DecodeOrderReplace(Replace(1, 5, 5, 50, 1000)));  // keeps its reference
+    CHECK(OnlyTripped(b, b.stats().duplicate_add));
 
-    m = OneOrder();
-    m.Execute(2, 5, 10);  // locate mismatch
-    CHECK(OnlyTripped(m, m.stats().locate_mismatch));
+    b = OneOrder();
+    b.Execute(2, 5, 10);  // locate mismatch
+    CHECK(OnlyTripped(b, b.stats().locate_mismatch));
 
-    m = OneOrder();
-    m.Execute(1, 5, 150);  // over-execution
-    CHECK(OnlyTripped(m, m.stats().over_execute));
+    b = OneOrder();
+    b.Execute(1, 5, 150);  // over-execution
+    CHECK(OnlyTripped(b, b.stats().over_execute));
 
-    m = OneOrder();
-    m.Cancel(itch::DecodeOrderCancel(Cancel(1, 5, 101)));  // over-cancel
-    CHECK(OnlyTripped(m, m.stats().over_cancel));
+    b = OneOrder();
+    b.Cancel(itch::DecodeOrderCancel(Cancel(1, 5, 101)));  // over-cancel
+    CHECK(OnlyTripped(b, b.stats().over_cancel));
 
-    m = OneOrder();
-    m.Add(itch::DecodeAddOrder(Add(1, 6, 'B', 0, 1000)));  // zero-share add
-    CHECK(OnlyTripped(m, m.stats().zero_share_add));
+    b = OneOrder();
+    b.Add(itch::DecodeAddOrder(Add(1, 6, 'B', 0, 1000)));  // zero-share add
+    CHECK(OnlyTripped(b, b.stats().zero_share_add));
 }
 
 // ----- reader ---------------------------------------------------------------------
@@ -344,6 +398,8 @@ void TestReplayDay() {
           r.counts['D'] == 1 && r.counts['S'] == 2);
     CHECK(r.stats.peak_live == 1);
     CHECK(r.live_at_end == 0);
+    CHECK(r.levels_consistent);
+    CHECK(r.crossed.empty());
 }
 
 // Every way a file can be wrong that would otherwise be reported as a clean day.
@@ -383,6 +439,52 @@ void TestReplayRejectsBadInput() {
     }
 }
 
+// A query stops at the requested time: the book reflects every message up to it and
+// none after.
+void TestReplayQuery() {
+    const auto day = Day({
+        At(Directory(1, "MSFT"), 1),
+        At(Add(1, 5, 'B', 100, 1072600), 10),
+        At(Add(1, 6, 'S', 50, 1072700), 20),
+        At(Add(1, 7, 'B', 300, 1072800), 30),  // would cross the book, but it is after the query
+        At(Delete(1, 7), 40),
+        At(Delete(1, 5), 50),
+        At(Delete(1, 6), 60),
+    });
+    const auto r = ReplayBytes(day, {"MSFT", 25});
+    CHECK(r.error.empty());
+    CHECK(r.snapshot.has_value());
+    if (!r.snapshot) return;
+    CHECK(r.snapshot->bids.size() == 1 && r.snapshot->bids.rbegin()->first == 1072600);
+    CHECK(r.snapshot->bids.rbegin()->second == L(100, 1));
+    CHECK(r.snapshot->asks.begin()->first == 1072700 &&
+          r.snapshot->asks.begin()->second == L(50, 1));
+    CHECK(ReplayBytes(day, {"AAPL", 25}).error.find("not in the Stock Directory") !=
+          std::string::npos);
+}
+
+// A crossed book during continuous trading is logged with the symbol and its bounds;
+// the same crossing before the open is not.
+void TestReplayCrossedBook() {
+    const uint64_t t = fathom::kOpen + 1000;
+    const auto r = ReplayBytes(Day({
+        At(Directory(1, "MSFT"), 1),
+        At(Add(1, 5, 'B', 100, 1072600), t),
+        At(Add(1, 6, 'S', 50, 1072500), t + 1),  // ask below the bid: crossed
+        At(Delete(1, 6), t + 2),                 // uncrossed
+        At(Delete(1, 5), t + 3),
+        At(Add(2, 8, 'B', 100, 2000), 100),  // pre-open crossing on another stock
+        At(Add(2, 9, 'S', 100, 1000), 101),
+        At(Delete(2, 8), 102),
+        At(Delete(2, 9), 103),
+    }));
+    CHECK(r.error.empty());
+    CHECK(r.crossed.size() == 1);
+    if (r.crossed.size() != 1) return;
+    CHECK(r.crossed[0].symbol == "MSFT" && r.crossed[0].start == t + 1 &&
+          r.crossed[0].end == t + 2);
+}
+
 }  // namespace
 
 int main() {
@@ -395,13 +497,17 @@ int main() {
     TestDecodeCancel();
     TestDecodeDelete();
     TestDecodeReplace();
+    TestDecodeStockDirectory();
     TestWideValues();
     TestLifecycle();
     TestReplace();
+    TestLevels();
     TestIntegrityCounters();
     TestReaderAcrossRefills();
     TestReplayDay();
     TestReplayRejectsBadInput();
+    TestReplayQuery();
+    TestReplayCrossedBook();
 
     if (failures == 0) {
         std::printf("all tests passed\n");

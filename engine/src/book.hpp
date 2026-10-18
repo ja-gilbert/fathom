@@ -1,27 +1,32 @@
-// The order map: every displayed order currently resting on Nasdaq, keyed by its
-// reference number. (Non-displayed orders are never announced by ITCH, so they are
-// invisible here; their executions show up only as 'P' trades.)
+// The book: every displayed order resting on Nasdaq, and the price levels they form.
 //
 // Five of the seven order messages (E, C, X, D, U) identify an order only by reference
 // number and never repeat its side or symbol, so the engine has to remember what the
-// add said. The map keeps what the book will need (locate, side, shares, price) and
-// deliberately drops the MPID attribution, which nothing in the engine uses yet. The
-// lifecycle rules live here:
+// add said. The order map keeps that (locate, side, shares, price) and applies the
+// lifecycle rules:
 //   E, C, X  subtract shares; the order dies when it reaches zero
 //   D        removes the order outright
 //   U        removes the old reference and inserts the new one with the old side/locate;
 //            a replace to zero shares just kills the order
 //
+// On top of the order map, each stock keeps two sorted maps from price to level (total
+// shares, order count), one per side. Every change to an order also adjusts its level,
+// and a level disappears with its last order. The best bid is the last bid level and the
+// best ask the first ask level, so the top of the book is O(1).
+//
 // Instead of asserting, every violation of the lifecycle rules is counted in Stats. A
-// full-day replay proves the logic is right by ending with every counter at zero AND
-// no orders left live after the End of Messages event; the counters alone cannot see a
-// bug that fails to take shares off an order.
+// full-day replay proves the logic is right by ending with every counter at zero AND no
+// orders left live after the End of Messages event; the counters alone cannot see a bug
+// that fails to take shares off an order. LevelsConsistent() checks the levels against
+// the orders the same way.
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <unordered_map>
+#include <vector>
 
 #include "itch.hpp"
 
@@ -34,7 +39,20 @@ struct Order {
     uint32_t price;
 };
 
-class OrderMap {
+struct Level {
+    uint64_t shares = 0;
+    uint32_t count = 0;
+    bool operator==(const Level&) const = default;
+};
+
+// One stock's levels. Prices are ITCH Price(4): 1072600 is $107.26.
+struct Levels {
+    std::map<uint32_t, Level> bids;  // best bid is rbegin()
+    std::map<uint32_t, Level> asks;  // best ask is begin()
+    std::map<uint32_t, Level>& side(char s) { return s == 'B' ? bids : asks; }
+};
+
+class Book {
 public:
     struct Stats {
         // E/C/X/D/U naming a reference that is not live: never added, or already removed.
@@ -75,7 +93,7 @@ public:
 
     void Delete(const itch::OrderDelete& d) {
         const auto it = Lookup(d.hd.locate, d.ref);
-        if (it != orders_.end()) orders_.erase(it);
+        if (it != orders_.end()) Erase(it);
     }
 
     void Replace(const itch::OrderReplace& u) {
@@ -84,7 +102,7 @@ public:
         if (u.new_ref == u.old_ref)
             ++stats_.duplicate_add;  // a replace always issues a new reference
         Order order = it->second;
-        orders_.erase(it);
+        Erase(it);
         if (u.shares == 0) return;  // replaced to zero displayed shares: dead (spec 1.4)
         order.shares = u.shares;
         order.price = u.price;
@@ -94,6 +112,27 @@ public:
     const Order* Find(uint64_t ref) const {
         const auto it = orders_.find(ref);
         return it == orders_.end() ? nullptr : &it->second;
+    }
+
+    // A stock's levels; empty if nothing is resting in it.
+    const Levels& levels(uint16_t locate) const {
+        static const Levels kEmpty;
+        return locate < levels_.size() ? levels_[locate] : kEmpty;
+    }
+
+    // Rebuilds every level from the orders and compares. False means a level drifted.
+    bool LevelsConsistent() const {
+        std::vector<Levels> rebuilt(levels_.size());
+        for (const auto& [ref, o] : orders_) {
+            Level& level = rebuilt[o.locate].side(o.side)[o.price];
+            level.shares += o.shares;
+            ++level.count;
+        }
+        for (size_t i = 0; i < levels_.size(); ++i) {
+            if (levels_[i].bids != rebuilt[i].bids || levels_[i].asks != rebuilt[i].asks)
+                return false;
+        }
+        return true;
     }
 
     size_t live() const { return orders_.size(); }
@@ -114,25 +153,47 @@ private:
         return it;
     }
 
+    Level& LevelOf(const Order& o) {
+        if (o.locate >= levels_.size()) levels_.resize(o.locate + 1);
+        return levels_[o.locate].side(o.side)[o.price];
+    }
+
     void Insert(uint64_t ref, const Order& order) {
         if (!orders_.try_emplace(ref, order).second) {
             ++stats_.duplicate_add;
             return;
         }
         stats_.peak_live = std::max(stats_.peak_live, orders_.size());
+        Level& level = LevelOf(order);
+        level.shares += order.shares;
+        ++level.count;
+    }
+
+    // Removes an order from the map and from its level, dropping the level if empty.
+    void Erase(Map::iterator it) {
+        const Order& o = it->second;
+        auto& side = levels_[o.locate].side(o.side);
+        const auto level = side.find(o.price);
+        level->second.shares -= o.shares;
+        if (--level->second.count == 0) side.erase(level);
+        orders_.erase(it);
     }
 
     void Reduce(uint16_t locate, uint64_t ref, uint32_t shares, uint64_t& overflow_counter) {
         const auto it = Lookup(locate, ref);
         if (it == orders_.end()) return;
+        Order& o = it->second;
         // Taking more than remained is counted and clamped, so the unsigned subtraction
         // cannot wrap around; the order then dies at zero like any other.
-        if (shares > it->second.shares) ++overflow_counter;
-        it->second.shares -= std::min(shares, it->second.shares);
-        if (it->second.shares == 0) orders_.erase(it);
+        if (shares > o.shares) ++overflow_counter;
+        const uint32_t taken = std::min(shares, o.shares);
+        o.shares -= taken;
+        LevelOf(o).shares -= taken;
+        if (o.shares == 0) Erase(it);
     }
 
     Map orders_;
+    std::vector<Levels> levels_;  // indexed by stock locate
     Stats stats_;
 };
 

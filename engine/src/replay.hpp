@@ -1,24 +1,47 @@
 // The replay: stream ITCH messages through the reader, check that they form one
-// complete trading day, feed every order message to the order map, and report.
+// complete trading day, feed every order message to the book, and report. With a
+// query, it stops at the requested time and prints one symbol's book instead.
 //
-// Lives here in a header rather than main so tests can run it on crafted input
-// and check exactly which validation is firing.
+// It lives in a header rather than main.cpp so the tests can run it on crafted input
+// and check exactly which validation fires.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <format>
 #include <iomanip>
 #include <istream>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <vector>
 
+#include "book.hpp"
 #include "itch.hpp"
 #include "itch_reader.hpp"
-#include "order_map.hpp"
 
 namespace fathom {
+
+constexpr uint64_t kNanosPerSecond = 1'000'000'000;
+constexpr uint64_t kOpen = (9 * 3600 + 30 * 60) * kNanosPerSecond;  // 09:30 ET
+constexpr uint64_t kNoon = 12 * 3600 * kNanosPerSecond;
+constexpr uint64_t kClose = 16 * 3600 * kNanosPerSecond;
+constexpr uint64_t kNoQuery = UINT64_MAX;
+
+struct ReplayOptions {
+    std::string symbol;      // with `at`: stop there and report this symbol's book
+    uint64_t at = kNoQuery;  // nanoseconds since midnight ET
+};
+
+// A stretch of continuous trading during which a stock's best bid met or passed its
+// best ask. Halts and auctions can do this legitimately, so it is logged, not failed.
+struct Crossed {
+    std::string symbol;
+    uint64_t start;
+    uint64_t end;
+};
 
 struct ReplayResult {
     std::string error;  // empty on success
@@ -26,11 +49,47 @@ struct ReplayResult {
     uint64_t bytes = 0;
     double seconds = 0;
     std::array<uint64_t, 256> counts{};
-    OrderMap::Stats stats;
+    Book::Stats stats;
     size_t live_at_end = 0;
+    bool levels_consistent = true;  // levels rebuilt from the orders at noon and at the close
+    std::vector<Crossed> crossed;
+    std::optional<Levels> snapshot;  // the queried symbol's book at `at`
 };
 
 namespace detail {
+
+// HH:MM:SS.nnnnnnnnn
+inline std::string Clock(uint64_t ns) {
+    const uint64_t s = ns / kNanosPerSecond;
+    return std::format("{:02}:{:02}:{:02}.{:09}", s / 3600, s / 60 % 60, s % 60,
+                       ns % kNanosPerSecond);
+}
+
+inline std::string Dollars(uint32_t price) {
+    return std::format("{}.{:04}", price / 10000, price % 10000);
+}
+
+inline std::string Trim(const std::array<char, 8>& s) {
+    return std::string(s.data(), std::find(s.begin(), s.end(), ' '));
+}
+
+// A price ladder: the best five asks above the best five bids, highest price first.
+inline void PrintSnapshot(std::ostream& out, const std::string& symbol, uint64_t at,
+                          const Levels& book) {
+    out << symbol << " at " << Clock(at) << " ET\n";
+    std::vector<std::pair<uint32_t, Level>> asks(book.asks.begin(), book.asks.end());
+    asks.resize(std::min<size_t>(asks.size(), 5));
+    for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
+        out << std::format("  ask {:>12} x {:<8} ({} orders)\n", Dollars(it->first),
+                           it->second.shares, it->second.count);
+    }
+    size_t shown = 0;
+    for (auto it = book.bids.rbegin(); it != book.bids.rend() && shown < 5; ++it, ++shown) {
+        out << std::format("  bid {:>12} x {:<8} ({} orders)\n", Dollars(it->first),
+                           it->second.shares, it->second.count);
+    }
+    if (book.asks.empty() && book.bids.empty()) out << "  (empty)\n";
+}
 
 inline void PrintReport(std::ostream& out, const ReplayResult& r, bool integrity) {
     for (const auto& spec : itch::kSpecs) {
@@ -49,7 +108,15 @@ inline void PrintReport(std::ostream& out, const ReplayResult& r, bool integrity
         << "  zero-share adds      " << std::setw(12) << s.zero_share_add << '\n'
         << "  peak live orders     " << std::setw(12) << s.peak_live << '\n'
         << "  live at end of day   " << std::setw(12) << r.live_at_end << '\n'
+        << "  levels match orders  " << std::setw(12) << (r.levels_consistent ? "yes" : "NO")
+        << '\n'
         << "  integrity            " << std::setw(12) << (integrity ? "OK" : "FAILED") << '\n';
+    out << "\ncrossed books during continuous trading (09:30-16:00): " << r.crossed.size() << '\n';
+    for (size_t i = 0; i < std::min<size_t>(r.crossed.size(), 10); ++i) {
+        const auto& c = r.crossed[i];
+        out << "  " << std::left << std::setw(8) << c.symbol << std::right << "  " << Clock(c.start)
+            << " to " << Clock(c.end) << '\n';
+    }
     const double bytes = static_cast<double>(r.bytes);
     out << "\ntotal " << r.total << " messages, " << std::fixed << std::setprecision(2)
         << bytes / 1e9 << " GB in " << r.seconds << " s ("
@@ -59,10 +126,13 @@ inline void PrintReport(std::ostream& out, const ReplayResult& r, bool integrity
 
 }  // namespace detail
 
-// Replays `in` and writes the report to `out`. The result's error is empty only if the
-// input is exactly one trading day, every frame is well formed, every integrity
-// counter is zero, and no order is left live at the end
-inline ReplayResult Replay(std::istream& in, std::ostream& out) {
+// Replays `in` and writes the report to `out`. Without a query, the result's error is
+// empty only if the input is exactly one trading day (System Event 'O' first, 'C' last,
+// nothing after), every frame is well formed, every integrity counter is zero, no order
+// is left live at the end, and the levels match the orders. With a query, the replay
+// stops at the first message past `options.at`, prints that symbol's book, and checks
+// only that the levels match the orders.
+inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOptions& options = {}) {
     ReplayResult r;
     auto fail = [&r](std::string message) {
         r.error = std::move(message);
@@ -70,9 +140,34 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out) {
     };
 
     itch::ItchReader reader(in);
-    OrderMap orders;
+    Book book;
+    std::vector<std::string> names;       // locate -> symbol, from the Stock Directory
+    std::vector<uint64_t> crossed_since;  // locate -> when its book crossed, 0 if it isn't
+    std::optional<uint16_t> query_locate;
     bool ended = false;  // have we seen System Event 'C'?
+    bool noon_checked = false;
+    uint64_t last_ts = 0;
     const auto start = std::chrono::steady_clock::now();
+
+    auto name = [&](uint16_t locate) {
+        return locate < names.size() && !names[locate].empty() ? names[locate]
+                                                               : std::to_string(locate);
+    };
+    // After a stock's book changes: note when its best bid meets or passes its best ask
+    // during continuous trading, and when that ends.
+    auto track_crossed = [&](uint16_t locate, uint64_t ts) {
+        const Levels& l = book.levels(locate);
+        const bool crossed =
+            !l.bids.empty() && !l.asks.empty() && l.bids.rbegin()->first >= l.asks.begin()->first;
+        if (locate >= crossed_since.size()) crossed_since.resize(locate + 1, 0);
+        uint64_t& since = crossed_since[locate];
+        if (crossed && since == 0 && ts >= kOpen && ts < kClose) {
+            since = ts;
+        } else if (!crossed && since != 0) {
+            r.crossed.push_back({name(locate), since, ts});
+            since = 0;
+        }
+    };
 
     while (true) {
         const uint64_t offset = reader.offset();
@@ -88,6 +183,12 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out) {
             return fail(std::format("message type '{}'{} has length {}, expected {}",
                                     static_cast<char>(type), at(), msg.size(), expected));
         }
+        const uint64_t ts = itch::Timestamp(msg);
+        if (ts > options.at) break;  // the query time has passed; the book is as of `at`
+        if (!noon_checked && ts >= kNoon) {
+            r.levels_consistent = book.LevelsConsistent();
+            noon_checked = true;
+        }
         if (ended) return fail("message" + at() + " follows System Event 'C' (end of messages)");
         const bool starts = type == 'S' && msg[11] == 'O';
         if (r.total == 0 && !starts) {
@@ -98,30 +199,44 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out) {
         ended = type == 'S' && msg[11] == 'C';
         ++r.counts[type];
         ++r.total;
+        last_ts = ts;
 
+        const uint16_t locate = itch::ReadU16(msg.data() + 1);
         switch (type) {
+            case 'R': {
+                if (locate >= names.size()) names.resize(locate + 1);
+                names[locate] = detail::Trim(itch::DecodeStockDirectory(msg).stock);
+                if (names[locate] == options.symbol) query_locate = locate;
+                break;
+            }
             case 'A':
             case 'F':
-                orders.Add(itch::DecodeAddOrder(msg));
+                book.Add(itch::DecodeAddOrder(msg));
+                track_crossed(locate, ts);
                 break;
             case 'E': {
                 const auto e = itch::DecodeOrderExecuted(msg);
-                orders.Execute(e.hd.locate, e.ref, e.shares);
+                book.Execute(e.hd.locate, e.ref, e.shares);
+                track_crossed(locate, ts);
                 break;
             }
             case 'C': {
                 const auto c = itch::DecodeOrderExecutedWithPrice(msg);
-                orders.Execute(c.hd.locate, c.ref, c.shares);
+                book.Execute(c.hd.locate, c.ref, c.shares);
+                track_crossed(locate, ts);
                 break;
             }
             case 'X':
-                orders.Cancel(itch::DecodeOrderCancel(msg));
+                book.Cancel(itch::DecodeOrderCancel(msg));
+                track_crossed(locate, ts);
                 break;
             case 'D':
-                orders.Delete(itch::DecodeOrderDelete(msg));
+                book.Delete(itch::DecodeOrderDelete(msg));
+                track_crossed(locate, ts);
                 break;
             case 'U':
-                orders.Replace(itch::DecodeOrderReplace(msg));
+                book.Replace(itch::DecodeOrderReplace(msg));
+                track_crossed(locate, ts);
                 break;
             default:
                 break;  // not an order message
@@ -130,6 +245,18 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out) {
 
     r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     r.bytes = reader.offset();
+
+    if (options.at != kNoQuery) {
+        if (!query_locate)
+            return fail("symbol " + options.symbol + " is not in the Stock Directory");
+        r.snapshot = book.levels(*query_locate);
+        r.levels_consistent = book.LevelsConsistent();
+        detail::PrintSnapshot(out, options.symbol, options.at, *r.snapshot);
+        if (!r.levels_consistent)
+            return fail("price levels do not match the orders at the query time");
+        return r;
+    }
+
     const std::string at = " at byte offset " + std::to_string(reader.offset());
     if (reader.read_error()) {
         return fail("read error after the last complete message, which ends" + at);
@@ -140,9 +267,14 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out) {
     }
     if (!ended) return fail("file does not end with System Event 'C' (end of messages)");
 
-    r.stats = orders.stats();
-    r.live_at_end = orders.live();
-    const bool integrity = r.stats.clean() && r.live_at_end == 0;
+    for (uint16_t locate = 0; locate < crossed_since.size(); ++locate) {
+        if (crossed_since[locate] != 0)
+            r.crossed.push_back({name(locate), crossed_since[locate], last_ts});
+    }
+    r.stats = book.stats();
+    r.live_at_end = book.live();
+    r.levels_consistent = r.levels_consistent && book.LevelsConsistent();
+    const bool integrity = r.stats.clean() && r.live_at_end == 0 && r.levels_consistent;
     detail::PrintReport(out, r, integrity);
     if (!integrity) return fail("integrity check failed; see the order map section of the report");
     return r;
