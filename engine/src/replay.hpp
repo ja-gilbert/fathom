@@ -31,8 +31,10 @@ constexpr uint64_t kClose = 16 * 3600 * kNanosPerSecond;
 constexpr uint64_t kNoQuery = UINT64_MAX;
 
 struct ReplayOptions {
-    std::string symbol;      // with `at`: stop there and report this symbol's book
-    uint64_t at = kNoQuery;  // nanoseconds since midnight ET
+    std::string symbol;           // the symbol a query or top-of-book log is about
+    uint64_t at = kNoQuery;       // query: stop here (ns since midnight ET) and print the book
+    std::ostream* bbo = nullptr;  // if set, one CSV line each time the symbol's top of book moves;
+                                  // seq is the message's 1-based position in the file
 };
 
 // A stretch of continuous trading during which a stock's best bid met or passed its
@@ -153,9 +155,20 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
         return locate < names.size() && !names[locate].empty() ? names[locate]
                                                                : std::to_string(locate);
     };
+    // The queried symbol's top of book as last written to the --bbo log; 0 means no level.
+    struct Top {
+        uint32_t bid_px = 0, ask_px = 0;
+        uint64_t bid_sz = 0, ask_sz = 0;
+        uint32_t bid_ct = 0, ask_ct = 0;
+        bool operator==(const Top&) const = default;
+    };
+    Top last_top;
+    if (options.bbo) *options.bbo << "ts,seq,offset,bid_px,bid_sz,bid_ct,ask_px,ask_sz,ask_ct\n";
+
     // After a stock's book changes: note when its best bid meets or passes its best ask
-    // during continuous trading, and when that ends.
-    auto track_crossed = [&](uint16_t locate, uint64_t ts) {
+    // during continuous trading (and when that ends), and log the queried symbol's top
+    // of book if it moved.
+    auto after_change = [&](uint16_t locate, uint64_t ts, uint64_t offset) {
         const Levels& l = book.levels(locate);
         const bool crossed =
             !l.bids.empty() && !l.asks.empty() && l.bids.rbegin()->first >= l.asks.begin()->first;
@@ -166,6 +179,23 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
         } else if (!crossed && since != 0) {
             r.crossed.push_back({name(locate), since, ts});
             since = 0;
+        }
+        if (options.bbo && query_locate == locate) {
+            Top top;
+            if (!l.bids.empty()) {
+                const auto& [px, level] = *l.bids.rbegin();
+                top.bid_px = px, top.bid_sz = level.shares, top.bid_ct = level.count;
+            }
+            if (!l.asks.empty()) {
+                const auto& [px, level] = *l.asks.begin();
+                top.ask_px = px, top.ask_sz = level.shares, top.ask_ct = level.count;
+            }
+            if (!(top == last_top)) {
+                *options.bbo << ts << ',' << r.total << ',' << offset << ',' << top.bid_px << ','
+                             << top.bid_sz << ',' << top.bid_ct << ',' << top.ask_px << ','
+                             << top.ask_sz << ',' << top.ask_ct << '\n';
+                last_top = top;
+            }
         }
     };
 
@@ -212,31 +242,31 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
             case 'A':
             case 'F':
                 book.Add(itch::DecodeAddOrder(msg));
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             case 'E': {
                 const auto e = itch::DecodeOrderExecuted(msg);
                 book.Execute(e.hd.locate, e.ref, e.shares);
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             }
             case 'C': {
                 const auto c = itch::DecodeOrderExecutedWithPrice(msg);
                 book.Execute(c.hd.locate, c.ref, c.shares);
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             }
             case 'X':
                 book.Cancel(itch::DecodeOrderCancel(msg));
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             case 'D':
                 book.Delete(itch::DecodeOrderDelete(msg));
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             case 'U':
                 book.Replace(itch::DecodeOrderReplace(msg));
-                track_crossed(locate, ts);
+                after_change(locate, ts, offset);
                 break;
             default:
                 break;  // not an order message
