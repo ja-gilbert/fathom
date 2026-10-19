@@ -5,10 +5,15 @@
 //   fathom <itch file> --symbol MSFT --bbo          CSV of every change to MSFT's top of
 //                                                   book on stdout; the report goes to stderr
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
+#include <span>
 #include <string_view>
 
 #include "replay.hpp"
@@ -16,7 +21,8 @@
 namespace {
 
 int Usage() {
-    std::cerr << "usage: fathom <itch file> [--symbol SYM (--at HH:MM:SS[.fraction] | --bbo)]\n";
+    std::cerr << "usage: fathom <itch file> [--bench] [--symbol SYM (--at HH:MM:SS[.fraction] | "
+                 "--bbo)]\n";
     return 1;
 }
 
@@ -45,6 +51,8 @@ int main(int argc, char* argv[]) {
             if (!ParseClock(argv[++i], options.at)) return Usage();
         } else if (arg == "--bbo") {
             bbo = true;
+        } else if (arg == "--bench") {
+            options.bench = true;
         } else if (path == nullptr) {
             path = argv[i];
         } else {
@@ -55,11 +63,23 @@ int main(int argc, char* argv[]) {
     const bool wants_symbol = options.at != fathom::kNoQuery || bbo;
     if (path == nullptr || options.symbol.empty() == wants_symbol) return Usage();
 
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // Map the file and let the kernel page it in as the replay walks
+    // forward, instead of copying it through a buffer.
+    const int fd = ::open(path, O_RDONLY);
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0) {
         std::cerr << "could not open " << path << '\n';
         return 1;
     }
+    const auto size = static_cast<size_t>(st.st_size);
+    void* mapped = size == 0 ? nullptr : ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        std::cerr << "could not map " << path << '\n';
+        return 1;
+    }
+    if (mapped != nullptr) ::madvise(mapped, size, MADV_SEQUENTIAL);
+    const std::span<const uint8_t> in(static_cast<const uint8_t*>(mapped), size);
+
     if (bbo) options.bbo = &std::cout;
     const auto result = fathom::Replay(in, bbo ? std::cerr : std::cout, options);
     if (result.error.empty()) return 0;

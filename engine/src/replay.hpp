@@ -15,6 +15,7 @@
 #include <istream>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,7 @@ struct ReplayOptions {
     uint64_t at = kNoQuery;       // query: stop here (ns since midnight ET) and print the book
     std::ostream* bbo = nullptr;  // if set, one CSV line each time the symbol's top of book moves;
                                   // seq is the message's 1-based position in the file
+    bool bench = false;           // time every 1000th order message's apply; report percentiles
 };
 
 // A stretch of continuous trading during which a stock's best bid met or passed its
@@ -55,10 +57,18 @@ struct ReplayResult {
     size_t live_at_end = 0;
     bool levels_consistent = true;  // levels rebuilt from the orders at noon and at the close
     std::vector<Crossed> crossed;
-    std::optional<Levels> snapshot;  // the queried symbol's book at `at`
+    std::optional<Levels> snapshot;        // the queried symbol's book at `at`
+    size_t latency_samples = 0;            // with `bench`: sampled order messages
+    std::array<uint64_t, 3> latency_ns{};  // their apply time at p50, p99, p99.9
 };
 
 namespace detail {
+
+constexpr std::array<bool, 256> kOrderType = [] {
+    std::array<bool, 256> t{};
+    for (char c : {'A', 'F', 'E', 'C', 'X', 'D', 'U'}) t[static_cast<uint8_t>(c)] = true;
+    return t;
+}();
 
 // HH:MM:SS.nnnnnnnnn
 inline std::string Clock(uint64_t ns) {
@@ -75,11 +85,11 @@ inline std::string Trim(const std::array<char, 8>& s) {
     return std::string(s.data(), std::find(s.begin(), s.end(), ' '));
 }
 
-// A price ladder: the best five asks above the best five bids, highest price first.
+// A price ladder: the best five asks (highest first) above the best five bids.
 inline void PrintSnapshot(std::ostream& out, const std::string& symbol, uint64_t at,
                           const Levels& book) {
     out << symbol << " at " << Clock(at) << " ET\n";
-    std::vector<std::pair<uint32_t, Level>> asks(book.asks.begin(), book.asks.end());
+    std::vector<std::pair<uint32_t, Level>> asks(book.asks.rbegin(), book.asks.rend());
     asks.resize(std::min<size_t>(asks.size(), 5));
     for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
         out << std::format("  ask {:>12} x {:<8} ({} orders)\n", Dollars(it->first),
@@ -124,6 +134,11 @@ inline void PrintReport(std::ostream& out, const ReplayResult& r, bool integrity
         << bytes / 1e9 << " GB in " << r.seconds << " s ("
         << static_cast<double>(r.total) / r.seconds / 1e6 << " M msg/s, " << bytes / r.seconds / 1e6
         << " MB/s)\n";
+    if (r.latency_samples != 0) {
+        out << "apply latency, " << r.latency_samples << " sampled order messages: p50 "
+            << r.latency_ns[0] << " ns, p99 " << r.latency_ns[1] << " ns, p99.9 " << r.latency_ns[2]
+            << " ns\n";
+    }
 }
 
 }  // namespace detail
@@ -134,14 +149,15 @@ inline void PrintReport(std::ostream& out, const ReplayResult& r, bool integrity
 // is left live at the end, and the levels match the orders. With a query, the replay
 // stops at the first message past `options.at`, prints that symbol's book, and checks
 // only that the levels match the orders.
-inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOptions& options = {}) {
+namespace detail {
+
+inline ReplayResult Run(itch::ItchReader& reader, std::ostream& out, const ReplayOptions& options) {
     ReplayResult r;
     auto fail = [&r](std::string message) {
         r.error = std::move(message);
         return r;
     };
 
-    itch::ItchReader reader(in);
     Book book;
     std::vector<std::string> names;       // locate -> symbol, from the Stock Directory
     std::vector<uint64_t> crossed_since;  // locate -> when its book crossed, 0 if it isn't
@@ -149,6 +165,8 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
     bool ended = false;  // have we seen System Event 'C'?
     bool noon_checked = false;
     uint64_t last_ts = 0;
+    uint64_t order_messages = 0;    // only counted with `bench`
+    std::vector<uint64_t> samples;  // apply time of every 1000th order message, ns
     const auto start = std::chrono::steady_clock::now();
 
     auto name = [&](uint16_t locate) {
@@ -171,7 +189,7 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
     auto after_change = [&](uint16_t locate, uint64_t ts, uint64_t offset) {
         const Levels& l = book.levels(locate);
         const bool crossed =
-            !l.bids.empty() && !l.asks.empty() && l.bids.rbegin()->first >= l.asks.begin()->first;
+            !l.bids.empty() && !l.asks.empty() && l.bids.rbegin()->first >= l.asks.rbegin()->first;
         if (locate >= crossed_since.size()) crossed_since.resize(locate + 1, 0);
         uint64_t& since = crossed_since[locate];
         if (crossed && since == 0 && ts >= kOpen && ts < kClose) {
@@ -187,7 +205,7 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
                 top.bid_px = px, top.bid_sz = level.shares, top.bid_ct = level.count;
             }
             if (!l.asks.empty()) {
-                const auto& [px, level] = *l.asks.begin();
+                const auto& [px, level] = *l.asks.rbegin();
                 top.ask_px = px, top.ask_sz = level.shares, top.ask_ct = level.count;
             }
             if (!(top == last_top)) {
@@ -232,6 +250,10 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
         last_ts = ts;
 
         const uint16_t locate = itch::ReadU16(msg.data() + 1);
+        const bool sample =
+            options.bench && detail::kOrderType[type] && ++order_messages % 1000 == 0;
+        const auto t0 =
+            sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         switch (type) {
             case 'R': {
                 if (locate >= names.size()) names.resize(locate + 1);
@@ -271,10 +293,22 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
             default:
                 break;  // not an order message
         }
+        if (sample) {
+            samples.push_back(
+                static_cast<uint64_t>((std::chrono::steady_clock::now() - t0).count()));
+        }
     }
 
     r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     r.bytes = reader.offset();
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        r.latency_samples = samples.size();
+        for (size_t i = 0; const double q : {0.5, 0.99, 0.999}) {
+            r.latency_ns[i++] =
+                samples[static_cast<size_t>(q * static_cast<double>(samples.size() - 1))];
+        }
+    }
 
     if (options.at != kNoQuery) {
         if (!query_locate)
@@ -308,6 +342,20 @@ inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOpti
     detail::PrintReport(out, r, integrity);
     if (!integrity) return fail("integrity check failed; see the order map section of the report");
     return r;
+}
+
+}  // namespace detail
+
+inline ReplayResult Replay(std::istream& in, std::ostream& out, const ReplayOptions& options = {}) {
+    itch::ItchReader reader(in);
+    return detail::Run(reader, out, options);
+}
+
+// The same replay over an input already in memory, such as a mapped file.
+inline ReplayResult Replay(std::span<const uint8_t> mapped, std::ostream& out,
+                           const ReplayOptions& options = {}) {
+    itch::ItchReader reader(mapped);
+    return detail::Run(reader, out, options);
 }
 
 }  // namespace fathom
