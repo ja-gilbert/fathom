@@ -485,6 +485,33 @@ void TestReplayCrossedBook() {
           r.crossed[0].end == t + 2);
 }
 
+// The --bbo log has one line per change to the symbol's top of book (0 for an empty
+// side) and none for changes deeper in the book.
+void TestReplayBboLog() {
+    std::ostringstream log;
+    fathom::ReplayOptions options;
+    options.symbol = "MSFT";
+    options.bbo = &log;
+    const auto r = ReplayBytes(Day({
+                                   At(Directory(1, "MSFT"), 1),
+                                   At(Add(1, 5, 'B', 100, 1072600), 10),
+                                   At(Add(1, 6, 'S', 50, 1072700), 20),
+                                   At(Add(1, 7, 'B', 300, 1072500), 30),  // deeper: no line
+                                   At(Delete(1, 5), 40),  // best bid falls to 1072500
+                                   At(Delete(1, 7), 50),
+                                   At(Delete(1, 6), 60),
+                               }),
+                               options);
+    CHECK(r.error.empty());
+    CHECK(log.str() ==
+          "ts,seq,offset,bid_px,bid_sz,bid_ct,ask_px,ask_sz,ask_ct\n"
+          "10,3,55,1072600,100,1,0,0,0\n"
+          "20,4,93,1072600,100,1,1072700,50,1\n"
+          "40,6,169,1072500,300,1,1072700,50,1\n"
+          "50,7,190,0,0,0,1072700,50,1\n"
+          "60,8,211,0,0,0,0,0,0\n");
+}
+
 }  // namespace
 
 int main() {
@@ -508,6 +535,7 @@ int main() {
     TestReplayRejectsBadInput();
     TestReplayQuery();
     TestReplayCrossedBook();
+    TestReplayBboLog();
 
     if (failures == 0) {
         std::printf("all tests passed\n");
