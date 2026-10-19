@@ -11,6 +11,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
+#include <map>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -266,6 +269,39 @@ void TestWideValues() {
     CHECK(book.stats().clean());
 }
 
+// ----- order table ----------------------------------------------------------------
+
+// Insert, erase and find against a reference map, through enough churn that the table
+// grows and probe runs wrap; a wrong backward shift on erase would lose or misfile keys.
+void TestOrderTable() {
+    fathom::OrderTable table(16);
+    std::map<uint64_t, uint32_t> reference;
+    uint64_t key = 0x9E3779B97F4A7C15ull;
+    bool consistent = true;
+    for (int i = 0; i < 20000 && consistent; ++i) {
+        key = key * 6364136223846793005ull + 1442695040888963407ull;  // a cheap PRNG
+        if (i % 3 != 2 || reference.empty()) {
+            consistent &=
+                table.Insert(key, static_cast<uint32_t>(i)) == (reference.emplace(key, i).second);
+        } else {
+            const auto victim =
+                std::next(reference.begin(), static_cast<long>(key % reference.size()));
+            table.Erase(table.Find(victim->first));
+            reference.erase(victim);
+        }
+        if (i % 997 == 0) {
+            for (const auto& [k, v] : reference) {
+                const size_t slot = table.Find(k);
+                consistent &= slot != fathom::OrderTable::npos && table.value(slot) == v;
+            }
+            consistent &= table.size() == reference.size();
+        }
+    }
+    CHECK(consistent);
+    CHECK(table.Find(12345) == fathom::OrderTable::npos);
+    CHECK(!table.Insert(key, 0));  // the last key inserted is a duplicate
+}
+
 // ----- book: lifecycle and price levels ---------------------------------------------
 
 void TestLifecycle() {
@@ -308,15 +344,15 @@ void TestLevels() {
     const auto& l = book.levels(7);
     CHECK(l.bids.size() == 2 && l.asks.size() == 2);
     CHECK(l.bids.rbegin()->first == 1072600 && l.bids.rbegin()->second == L(300, 2));
-    CHECK(l.asks.begin()->first == 1072700 && l.asks.begin()->second == L(10, 1));
+    CHECK(l.asks.rbegin()->first == 1072700 && l.asks.rbegin()->second == L(10, 1));
 
     book.Execute(7, 1, 100);  // order 1 dies; its level keeps order 2
     CHECK(l.bids.rbegin()->second == L(200, 1));
     book.Cancel(itch::DecodeOrderCancel(Cancel(7, 2, 50)));
     CHECK(l.bids.rbegin()->second == L(150, 1));
     book.Replace(itch::DecodeOrderReplace(Replace(7, 5, 6, 10, 1072900)));  // ask moves away
-    CHECK(l.asks.begin()->first == 1072800);
-    CHECK(l.asks.size() == 2 && l.asks.count(1072700) == 0);
+    CHECK(l.asks.rbegin()->first == 1072800);
+    CHECK(l.asks.size() == 2 && !l.asks.contains(1072700));
     book.Delete(itch::DecodeOrderDelete(Delete(7, 2)));
     CHECK(l.bids.size() == 1 && l.bids.rbegin()->first == 1072500);
     CHECK(book.LevelsConsistent());
@@ -385,14 +421,18 @@ void TestReaderAcrossRefills() {
 // ----- replay end to end ------------------------------------------------------------
 
 void TestReplayDay() {
-    const auto r = ReplayBytes(Day({
+    const auto day = Day({
         Add(1, 5, 'B', 100, 1000000),
         Executed(1, 5, 40),
         Cancel(1, 5, 10),
         Replace(1, 5, 6, 80, 1000100),
         Delete(1, 6),
-    }));
+    });
+    const auto r = ReplayBytes(day);
     CHECK(r.error.empty());
+    std::ostringstream report;  // the in-memory path must agree with the stream path
+    const auto m = fathom::Replay(std::span<const uint8_t>(day), report);
+    CHECK(m.error.empty() && m.total == r.total && m.stats.peak_live == r.stats.peak_live);
     CHECK(r.total == 7);
     CHECK(r.counts['A'] == 1 && r.counts['E'] == 1 && r.counts['X'] == 1 && r.counts['U'] == 1 &&
           r.counts['D'] == 1 && r.counts['S'] == 2);
@@ -457,8 +497,8 @@ void TestReplayQuery() {
     if (!r.snapshot) return;
     CHECK(r.snapshot->bids.size() == 1 && r.snapshot->bids.rbegin()->first == 1072600);
     CHECK(r.snapshot->bids.rbegin()->second == L(100, 1));
-    CHECK(r.snapshot->asks.begin()->first == 1072700 &&
-          r.snapshot->asks.begin()->second == L(50, 1));
+    CHECK(r.snapshot->asks.rbegin()->first == 1072700 &&
+          r.snapshot->asks.rbegin()->second == L(50, 1));
     CHECK(ReplayBytes(day, {"AAPL", 25}).error.find("not in the Stock Directory") !=
           std::string::npos);
 }
@@ -526,6 +566,7 @@ int main() {
     TestDecodeReplace();
     TestDecodeStockDirectory();
     TestWideValues();
+    TestOrderTable();
     TestLifecycle();
     TestReplace();
     TestLevels();

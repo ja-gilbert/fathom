@@ -20,6 +20,19 @@ target_compile_options(fathom_core INTERFACE -Wall -Wextra -Wpedantic)
 
 add_executable(fathom engine/src/main.cpp)
 target_link_libraries(fathom PRIVATE fathom_core)
+# -O3 and the host's instruction set for the engine binary only; the
+# tests keep the default flags so the sanitizers see the plain code.
+target_compile_options(fathom PRIVATE -O3 -march=native)
+
+# Profile-guided optimization, in two configures (see scripts/pgo.sh).
+# Off by default so a fresh clone builds without a profile.
+set(FATHOM_PGO "" CACHE STRING "PGO phase for the engine binary: generate, use, or empty")
+if(FATHOM_PGO STREQUAL "generate")
+    target_compile_options(fathom PRIVATE -fprofile-generate=${CMAKE_BINARY_DIR}/pgo)
+    target_link_options(fathom PRIVATE -fprofile-generate=${CMAKE_BINARY_DIR}/pgo)
+elseif(FATHOM_PGO STREQUAL "use")
+    target_compile_options(fathom PRIVATE -fprofile-use=${CMAKE_BINARY_DIR}/pgo -fprofile-correction)
+endif()
 
 # The tests run under ASan and UBSan; no-recover makes a UBSan report fail the run.
 enable_testing()

@@ -24,11 +24,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "itch.hpp"
+#include "order_table.hpp"
 
 namespace fathom {
 
@@ -45,11 +45,60 @@ struct Level {
     bool operator==(const Level&) const = default;
 };
 
-// One stock's levels. Prices are ITCH Price(4): 1072600 is $107.26.
+// One side's price levels, kept in a vector sorted worst to best: bids ascending, asks
+// descending. The top of book is the last entry, and because most
+// adds, cancels and executions land near the top, an insert or erase moves only the few
+// entries behind it, instead of touching a tree node per level as std::map did.
+class LevelMap {
+public:
+    using Entry = std::pair<uint32_t, Level>;
+    using iterator = std::vector<Entry>::iterator;
+
+    explicit LevelMap(bool best_is_highest) : best_is_highest_(best_is_highest) {}
+
+    bool empty() const { return v_.empty(); }
+    size_t size() const { return v_.size(); }
+    // Worst to best; rbegin() walks from the top of book down.
+    auto begin() const { return v_.begin(); }
+    auto end() const { return v_.end(); }
+    auto rbegin() const { return v_.rbegin(); }
+    auto rend() const { return v_.rend(); }
+    bool contains(uint32_t price) const {
+        const auto it =
+            std::lower_bound(v_.begin(), v_.end(), price,
+                             [this](const Entry& e, uint32_t p) { return Worse(e.first, p); });
+        return it != v_.end() && it->first == price;
+    }
+
+    iterator find(uint32_t price) {
+        const auto it = Lower(price);
+        return it != v_.end() && it->first == price ? it : v_.end();
+    }
+    // The level at `price`, created empty if absent.
+    Level& operator[](uint32_t price) {
+        auto it = Lower(price);
+        if (it == v_.end() || it->first != price) it = v_.insert(it, {price, Level{}});
+        return it->second;
+    }
+    void erase(iterator it) { v_.erase(it); }
+    bool operator==(const LevelMap&) const = default;
+
+private:
+    bool Worse(uint32_t a, uint32_t b) const { return best_is_highest_ ? a < b : a > b; }
+    iterator Lower(uint32_t price) {
+        return std::lower_bound(v_.begin(), v_.end(), price,
+                                [this](const Entry& e, uint32_t p) { return Worse(e.first, p); });
+    }
+    bool best_is_highest_;
+    std::vector<Entry> v_;
+};
+
+// One stock's levels. Prices are ITCH Price(4): 1072600 is $107.26. The best bid and
+// the best ask are both rbegin() of their side.
 struct Levels {
-    std::map<uint32_t, Level> bids;  // best bid is rbegin()
-    std::map<uint32_t, Level> asks;  // best ask is begin()
-    std::map<uint32_t, Level>& side(char s) { return s == 'B' ? bids : asks; }
+    LevelMap bids{true};
+    LevelMap asks{false};
+    LevelMap& side(char s) { return s == 'B' ? bids : asks; }
 };
 
 class Book {
@@ -92,17 +141,17 @@ public:
     }
 
     void Delete(const itch::OrderDelete& d) {
-        const auto it = Lookup(d.hd.locate, d.ref);
-        if (it != orders_.end()) Erase(it);
+        const size_t slot = Lookup(d.hd.locate, d.ref);
+        if (slot != OrderTable::npos) Erase(slot);
     }
 
     void Replace(const itch::OrderReplace& u) {
-        const auto it = Lookup(u.hd.locate, u.old_ref);
-        if (it == orders_.end()) return;
+        const size_t slot = Lookup(u.hd.locate, u.old_ref);
+        if (slot == OrderTable::npos) return;
         if (u.new_ref == u.old_ref)
             ++stats_.duplicate_add;  // a replace always issues a new reference
-        Order order = it->second;
-        Erase(it);
+        Order order = At(slot);
+        Erase(slot);
         if (u.shares == 0) return;  // replaced to zero displayed shares: dead (spec 1.4)
         order.shares = u.shares;
         order.price = u.price;
@@ -110,8 +159,8 @@ public:
     }
 
     const Order* Find(uint64_t ref) const {
-        const auto it = orders_.find(ref);
-        return it == orders_.end() ? nullptr : &it->second;
+        const size_t slot = index_.Find(ref);
+        return slot == OrderTable::npos ? nullptr : &pool_[index_.value(slot)];
     }
 
     // A stock's levels; empty if nothing is resting in it.
@@ -123,7 +172,9 @@ public:
     // Rebuilds every level from the orders and compares. False means a level drifted.
     bool LevelsConsistent() const {
         std::vector<Levels> rebuilt(levels_.size());
-        for (const auto& [ref, o] : orders_) {
+        for (size_t slot = 0; slot < index_.capacity(); ++slot) {
+            if (index_.value(slot) == OrderTable::kEmpty) continue;
+            const Order& o = pool_[index_.value(slot)];
             Level& level = rebuilt[o.locate].side(o.side)[o.price];
             level.shares += o.shares;
             ++level.count;
@@ -135,23 +186,25 @@ public:
         return true;
     }
 
-    size_t live() const { return orders_.size(); }
+    size_t live() const { return index_.size(); }
     const Stats& stats() const { return stats_; }
 
-private:
-    using Map = std::unordered_map<uint64_t, Order>;
+    Book() { pool_.reserve(kExpectedLiveOrders); }
 
+private:
     // Finds a live order for a modify message and checks the message's locate against
-    // it. Returns end() and counts unknown_ref if the order is not live.
-    Map::iterator Lookup(uint16_t locate, uint64_t ref) {
-        const auto it = orders_.find(ref);
-        if (it == orders_.end()) {
+    // it. Returns its index slot, or npos (counting unknown_ref) if it is not live.
+    size_t Lookup(uint16_t locate, uint64_t ref) {
+        const size_t slot = index_.Find(ref);
+        if (slot == OrderTable::npos) {
             ++stats_.unknown_ref;
-        } else if (it->second.locate != locate) {
+        } else if (At(slot).locate != locate) {
             ++stats_.locate_mismatch;
         }
-        return it;
+        return slot;
     }
+
+    Order& At(size_t slot) { return pool_[index_.value(slot)]; }
 
     Level& LevelOf(const Order& o) {
         if (o.locate >= levels_.size()) levels_.resize(o.locate + 1);
@@ -159,40 +212,61 @@ private:
     }
 
     void Insert(uint64_t ref, const Order& order) {
-        if (!orders_.try_emplace(ref, order).second) {
+        // Reuse a pool slot freed by a dead order, or append; give it back on a duplicate.
+        uint32_t idx;
+        if (free_.empty()) {
+            idx = static_cast<uint32_t>(pool_.size());
+            pool_.push_back(order);
+        } else {
+            idx = free_.back();
+            free_.pop_back();
+            pool_[idx] = order;
+        }
+        if (!index_.Insert(ref, idx)) {
             ++stats_.duplicate_add;
+            free_.push_back(idx);
             return;
         }
-        stats_.peak_live = std::max(stats_.peak_live, orders_.size());
+        stats_.peak_live = std::max(stats_.peak_live, index_.size());
         Level& level = LevelOf(order);
         level.shares += order.shares;
         ++level.count;
     }
 
-    // Removes an order from the map and from its level, dropping the level if empty.
-    void Erase(Map::iterator it) {
-        const Order& o = it->second;
+    // Removes an order from the index, the pool and its level, dropping the level if
+    // empty.
+    void Erase(size_t slot) {
+        const uint32_t idx = index_.value(slot);
+        const Order& o = pool_[idx];
         auto& side = levels_[o.locate].side(o.side);
         const auto level = side.find(o.price);
         level->second.shares -= o.shares;
         if (--level->second.count == 0) side.erase(level);
-        orders_.erase(it);
+        index_.Erase(slot);
+        free_.push_back(idx);
     }
 
     void Reduce(uint16_t locate, uint64_t ref, uint32_t shares, uint64_t& overflow_counter) {
-        const auto it = Lookup(locate, ref);
-        if (it == orders_.end()) return;
-        Order& o = it->second;
+        const size_t slot = Lookup(locate, ref);
+        if (slot == OrderTable::npos) return;
+        Order& o = At(slot);
         // Taking more than remained is counted and clamped, so the unsigned subtraction
         // cannot wrap around; the order then dies at zero like any other.
         if (shares > o.shares) ++overflow_counter;
         const uint32_t taken = std::min(shares, o.shares);
         o.shares -= taken;
         LevelOf(o).shares -= taken;
-        if (o.shares == 0) Erase(it);
+        if (o.shares == 0) Erase(slot);
     }
 
-    Map orders_;
+    // Sized for the busiest day seen (1.93M live orders) so neither
+    // the index nor the pool grows mid-day. Orders live in a flat pool and the index
+    // maps reference number to pool slot; no heap allocation per order.
+    static constexpr size_t kExpectedLiveOrders = 1 << 22;
+
+    OrderTable index_{kExpectedLiveOrders};
+    std::vector<Order> pool_;
+    std::vector<uint32_t> free_;  // pool slots whose orders died
     std::vector<Levels> levels_;  // indexed by stock locate
     Stats stats_;
 };
