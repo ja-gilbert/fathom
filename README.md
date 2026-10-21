@@ -31,7 +31,8 @@ update), and its book matches Databento's independently built MBP-1 book on 100%
 
 ## Features
 
-- Parses all 23 TotalView-ITCH 5.0 message types from the raw binary file, with no
+- Frames and length-checks all 23 TotalView-ITCH 5.0 message types, and decodes the
+  eight it needs (the seven order messages and the Stock Directory), with no
   dependencies beyond the C++ standard library.
 - Maintains every displayed order and every price level (shares and order count) for all
   of Nasdaq's roughly 8,700 symbols at once.
@@ -248,8 +249,9 @@ levels rebuilt from scratch out of the orders equal the levels maintained increm
 | 2020-01-30 | 423,285,709 | 1,925,638        | 0          | 0           | yes          |
 
 The replay also logs every stretch of regular trading in which a stock's best bid met or
-crossed its best ask. The six such intervals on 2019-01-30 all fall inside trading halts
-or LULD pauses, when Nasdaq does not uncross the displayed book.
+crossed its best ask. The six such intervals on 2019-01-30, all in three small caps, line
+up with LULD limit states and trading pauses, when Nasdaq does not uncross the displayed
+book.
 
 ### Against Databento
 
@@ -300,7 +302,7 @@ full-day runs. Latency is the time to decode and apply one order message, sample
 | Step | Change                                                       | Wall time | msg/s  | p50    | p99.9     |
 |------|--------------------------------------------------------------|-----------|--------|--------|-----------|
 |      | baseline (`-O2`, `std::unordered_map`, `std::map` levels)    | 170.92 s  | 2.16 M | 483 ns | 11,662 ns |
-| 0    | `-O3 -march=native`                                          | 158.43 s  | 2.32 M | 447 ns | 5,076 ns  |
+| 0    | `-O3 -march=native`                                          | 158.43 s  | 2.33 M | 447 ns | 5,076 ns  |
 | 1    | pre-sized order map                                          | 141.00 s  | 2.61 M | 381 ns | 4,626 ns  |
 | 2    | flat hash table + order pool                                 | 122.64 s  | 3.00 M | 336 ns | 4,156 ns  |
 | 3    | sorted-vector price levels                                   | 80.73 s   | 4.56 M | 254 ns | 3,574 ns  |
