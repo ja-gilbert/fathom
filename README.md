@@ -42,16 +42,17 @@ update), and its book matches Databento's independently built MBP-1 book on 100%
   day with an integrity verdict: zero violations, zero orders left live, price levels
   that agree with the orders.
 - Verified against Databento's MBP-1 book for three symbol-days with zero mismatches.
-- Benchmark and profile-guided-optimisation scripts to reproduce the performance numbers.
+- Benchmark and profile-guided-optimization scripts to reproduce the performance numbers.
 
 ## Requirements
 
 - Linux (the engine memory-maps the input; tested on Ubuntu 24.04 under WSL2).
 - GCC 13 or newer, for C++20 including `std::format`. Tested with g++ 13.3.
 - CMake 3.28 or newer and a build tool such as Ninja.
-- Network access on the first configure: CMake fetches
-  [databento-cpp](https://github.com/databento/databento-cpp) for the tutorial programs
-  in `tutorials/`. The engine itself does not use it.
+- The Databento tutorial programs in `tutorials/` are off by default. Configuring with
+  `-DFATHOM_BUILD_TUTORIALS=ON` fetches [databento-cpp](https://github.com/databento/databento-cpp)
+  v0.68.1 and needs the OpenSSL and zstd development packages
+  (`sudo apt install libssl-dev libzstd-dev`). The engine needs none of this.
 - About 16 GB of disk per trading day of data (5 GB compressed, 11 to 13 GB decompressed).
 
 To reproduce the Databento comparison you also need Python 3.12, [uv](https://docs.astral.sh/uv/),
@@ -217,7 +218,7 @@ ts,seq,offset,bid_px,bid_sz,bid_ct,ask_px,ask_sz,ask_ct
 
 `0` if the replay completed and the integrity verdict is OK. `1` for a usage error, an
 unreadable or malformed file, or a failed integrity check; the reason is printed to
-stderr with the byte offset and time of the offending message.
+stderr, with the byte offset of the offending message when there is one.
 
 ## Tests
 
@@ -308,7 +309,7 @@ full-day runs. Latency is the time to decode and apply one order message, sample
 | 3    | sorted-vector price levels                                   | 80.73 s   | 4.56 M | 254 ns | 3,574 ns  |
 | 4    | replace in place                                             | skipped: only 1.6% of replaces keep their price | | | |
 | 5    | memory-mapped input                                          | 77.54 s   | 4.75 M | 258 ns | 3,867 ns  |
-| 6    | profile-guided optimisation [1]                              | 71.23 s   | 5.17 M | 257 ns | 3,911 ns  |
+| 6    | profile-guided optimization [1]                              | 71.23 s   | 5.17 M | 257 ns | 3,911 ns  |
 
 [1] Profile trained on 2020-01-30 and benchmarked on 2019-01-30. Trained on the
 benchmarked day itself: 64.76 s, p50 245 ns, p99.9 3,738 ns, the upper bound of what PGO
@@ -364,8 +365,8 @@ reference number, so the engine has to remember what the add said. `OrderTable` 
 open-addressing hash map from 64-bit reference to a 32-bit slot in a flat order pool:
 Fibonacci hashing, linear probing, and backward-shift erase so deletes leave no
 tombstones. It is pre-sized to four million slots, above the busiest day's 1.93 million
-live orders, so nothing grows or allocates during the replay. Orders live in one
-`std::vector` with a free list; an `Order` is 12 bytes (stock locate, side, shares,
+live orders, so neither the table nor the pool grows during the replay. Orders live in
+one `std::vector` with a free list; an `Order` is 12 bytes (stock locate, side, shares,
 price).
 
 **Book.** The lifecycle rules in one place: `E`, `C` and `X` subtract shares and the order
