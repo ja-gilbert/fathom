@@ -5,13 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(FetchContent)
-FetchContent_Declare(
-        databento
-        GIT_REPOSITORY https://github.com/databento/databento-cpp
-        GIT_TAG main
-)
-FetchContent_MakeAvailable(databento)
+option(FATHOM_BUILD_TUTORIALS "Build the Databento tutorial programs (needs OpenSSL and zstd)" OFF)
+if(FATHOM_BUILD_TUTORIALS)
+    include(FetchContent)
+    FetchContent_Declare(
+            databento
+            GIT_REPOSITORY https://github.com/databento/databento-cpp
+            GIT_TAG v0.68.1
+    )
+    FetchContent_MakeAvailable(databento)
+endif()
 
 # Header-only engine code and the warning flags, shared by the executable and the tests.
 add_library(fathom_core INTERFACE)
@@ -43,11 +46,13 @@ target_compile_options(itch_test PRIVATE -fsanitize=address,undefined -fno-sanit
 target_link_options(itch_test PRIVATE -fsanitize=address,undefined)
 add_test(NAME itch_test COMMAND itch_test)
 
-add_executable(order_actions tutorials/01_order_actions.cpp)
-target_link_libraries(order_actions PRIVATE databento::databento)
+if(FATHOM_BUILD_TUTORIALS)
+    add_executable(order_actions tutorials/01_order_actions.cpp)
+    target_link_libraries(order_actions PRIVATE databento::databento)
 
-add_executable(order_tracking tutorials/02_order_tracking.cpp)
-target_link_libraries(order_tracking PRIVATE databento::databento)
+    add_executable(order_tracking tutorials/02_order_tracking.cpp)
+    target_link_libraries(order_tracking PRIVATE databento::databento)
 
-add_executable(limit_order_book tutorials/03_limit_order_book.cpp)
-target_link_libraries(limit_order_book PRIVATE databento::databento)
+    add_executable(limit_order_book tutorials/03_limit_order_book.cpp)
+    target_link_libraries(limit_order_book PRIVATE databento::databento)
+endif()
