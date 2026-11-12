@@ -4,9 +4,9 @@ Rebuilds Nasdaq's full-depth limit order book from a raw TotalView-ITCH 5.0 day 
 
 fathom is a C++20 engine that replays every order message Nasdaq published on a trading
 day, maintains the order book for every listed symbol, and checks its own work. It replays
-a 368 million message day in 71 seconds on one core (5.2 M msg/s, 257 ns median per order
-update), and its book matches Databento's independently built MBP-1 book on 100% of the
-2.28 million top-of-book records compared.
+a 368 million message day on one core, 2.2x faster than its unoptimized baseline, and
+its book matches Databento's independently built MBP-1 book on 100% of the
+2.28 million top-of-book records compared (MSFT and AAPL, three symbol-days).
 
 ## Table of contents
 
@@ -98,7 +98,7 @@ build/fathom data/raw/01302019.NASDAQ_ITCH50
 
 Replays the whole day and prints the report described under [Usage](#usage). The first
 run reads the file from disk; later runs, with the file in the page cache, take about
-70 seconds for the 2019 day.
+70 to 85 seconds for the 2019 day.
 
 ## Usage
 
@@ -165,8 +165,9 @@ total 368366634 messages, 11.25 GB in 73.48 s (5.01 M msg/s, 153.05 MB/s)
 
 The order-map block is the integrity check. `integrity OK` means every counter is zero,
 no orders were left live after Nasdaq's End of Messages event, and the price levels
-maintained incrementally equal the levels rebuilt from the orders (checked at noon and at
-the close).
+maintained incrementally equal the levels rebuilt from the orders. The full-book check
+runs at noon; a second check runs after the day's last message, when the book is empty,
+so it only confirms that every level was cleared.
 
 ### Book snapshot
 
@@ -295,7 +296,10 @@ mismatches side by side if there are any.
 
 ## Performance
 
-Measured on 2019-01-30 (368 M messages, 11.25 GB) on an i9-14900HX under WSL2, pinned to
+The step table below was recorded while the optimizations were made, and committed on
+2026-10-19 (c12a702). The steps were squashed into that commit, so only the baseline
+and the final build can be rebuilt. Each row was measured on 2019-01-30 (368 M messages,
+11.25 GB) on an i9-14900HX under WSL2, pinned to
 one P-core, with the file in the page cache, g++ 13.3. Wall time is the median of three
 full-day runs. Latency is the time to decode and apply one order message, sampled every
 1,000th.
@@ -315,7 +319,24 @@ full-day runs. Latency is the time to decode and apply one order message, sample
 benchmarked day itself: 64.76 s, p50 245 ns, p99.9 3,738 ns, the upper bound of what PGO
 gives here.
 
-Every step was re-verified against the MSFT 2019 Databento reference before it was kept.
+Rerun on 2026-11-11 on the same machine: the baseline rebuilt from commit bb0463d at `-O2`,
+and the final build with and without the PGO profile trained on 2020-01-30.
+
+| Session                                 | Baseline | No PGO  | PGO     | Speedup, no PGO / PGO |
+|-----------------------------------------|----------|---------|---------|-----------------------|
+| `scripts/bench.sh`, median of 3 runs    | 156.42 s | 75.40 s | 68.60 s | 2.07x / 2.28x         |
+| interleaved, 3 rounds, median per build | 167.59 s | 83.51 s | 75.90 s | 2.01x / 2.21x         |
+
+The same binary varied by roughly ±10% from run to run (across the interleaved rounds,
+the baseline took 140.90 s to 171.75 s and the PGO build 62.80 s to 82.37 s), so
+absolute times only compare within one session. Within a session the speedup is 2.2x
+to 2.3x with PGO and 2.0x to 2.1x without it; the 2.4x implied by the table above did
+not reproduce. The sampled p50 came out close to the record: 261 ns without PGO and
+252 ns with it.
+
+The output is unchanged by the optimizations: the optimized build still matches Databento
+on all three symbol-days with zero mismatches, and its MSFT and AAPL top-of-book logs for
+2020-01-30 are byte-identical to the ones the unoptimized build wrote.
 The biggest single win was the price levels: `std::map` touched a heap node per level on
 every update, while a sorted vector with the best price at the back keeps the hot end of
 the book in a few cache lines. A flat array indexed by price tick was ruled out because
