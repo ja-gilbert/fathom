@@ -55,7 +55,7 @@ struct ReplayResult {
     std::array<uint64_t, 256> counts{};
     Book::Stats stats;
     size_t live_at_end = 0;
-    bool levels_consistent = true;  // levels rebuilt from the orders at noon and at the close
+    bool levels_consistent = true;  // levels rebuilt from the orders at noon and at end of file
     std::vector<Crossed> crossed;
     std::optional<Levels> snapshot;        // the queried symbol's book at `at`
     size_t latency_samples = 0;            // with `bench`: sampled order messages
